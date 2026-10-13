@@ -1,0 +1,38 @@
+# Secrets, credentials and local runtime configuration
+.env
+.env.*
+!.env.example
+.aws/
+**/.aws/
+.streamlit/secrets.toml
+**/secrets.toml
+credentials
+credentials.*
+credentials.json
+aws_credentials
+*.pem
+*.key
+
+# Source-control and local development state
+.git/
+.gitignore
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# Tests, docs, generated data and local uploads are not runtime inputs
+tests/
+docs/
+NovaMind-AI-Learning/
+uploads/
+tmp/
+*.tmp
+*.log

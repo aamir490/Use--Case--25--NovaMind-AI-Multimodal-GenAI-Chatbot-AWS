@@ -1,0 +1,7 @@
+# Direct runtime dependencies; edit together with the reviewed lock.
+# Pillow and pypdf are REQUIRED validation dependencies, not preview extras.
+boto3==1.43.66
+botocore==1.43.66
+streamlit==1.61.1
+Pillow==12.3.0
+pypdf==6.15.0

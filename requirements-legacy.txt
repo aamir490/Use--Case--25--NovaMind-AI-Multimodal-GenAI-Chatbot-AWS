@@ -1,0 +1,5 @@
+# Optional legacy DOC/XLS validation; DOCX/XLSX use the standard library.
+# olefile is absent from the baseline environment: installation and real-file
+# compatibility must be verified separately. Missing olefile fails closed.
+-r requirements.txt
+olefile==0.47

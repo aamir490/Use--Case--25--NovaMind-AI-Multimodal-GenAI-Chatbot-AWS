@@ -1,0 +1,3 @@
+# Compatibility entry point for existing installation commands.
+# Canonical version lock and Python baseline: docs/dependencies.md.
+-r requirements.txt
