@@ -1,0 +1,207 @@
+name: NovaMind AI - Continuous Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+concurrency:
+  group: novamind-chatbot-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Amazon ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify successful CI for commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "Deployment is permitted only from main."
+            exit 1
+          fi
+
+          RUNS=$(gh api \
+            "repos/${REPOSITORY}/actions/workflows/383313071/runs?head_sha=${COMMIT_SHA}&event=push&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | length')
+
+          if [ "$RUNS" -lt 1 ]; then
+            echo "No successful push-triggered CI run found for ${COMMIT_SHA}."
+            exit 1
+          fi
+
+          echo "Successful CI verified for ${COMMIT_SHA}."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::357001292388:role/novamind-chatbot-github-actions-role
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REPOSITORY: 357001292388.dkr.ecr.us-east-1.amazonaws.com/novamind-chatbot-ecr
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          if aws ecr describe-images \
+            --repository-name novamind-chatbot-ecr \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text > image-digest.txt 2> ecr-error.txt; then
+
+            IMAGE_DIGEST=$(cat image-digest.txt)
+            if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Invalid ECR image digest."
+              exit 1
+            fi
+
+            echo "Existing immutable image found; reusing $IMAGE_URI"
+          elif grep -q 'ImageNotFoundException' ecr-error.txt; then
+            echo "Image not found. Building and pushing..."
+            docker build -t "$IMAGE_URI" .
+            docker push "$IMAGE_URI"
+          else
+            echo "ECR lookup failed:"
+            cat ecr-error.txt
+            exit 1
+          fi
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Register new ECS task definition
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-task-definition \
+            --task-definition novamind-chatbot-task \
+            --query taskDefinition \
+            --output json > current-task.json
+
+          jq --arg IMAGE "$IMAGE_URI" \
+            'del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+            | (.containerDefinitions[] | select(.name == "novamind-chatbot") | .image) = $IMAGE' \
+            current-task.json > new-task.json
+
+          # Validate that the only configuration change is the container image.
+          jq -e --slurpfile original current-task.json \
+            --arg IMAGE "$IMAGE_URI" \
+            '
+              ($original[0] |
+                del(
+                  .taskDefinitionArn,
+                  .revision,
+                  .status,
+                  .requiresAttributes,
+                  .compatibilities,
+                  .registeredAt,
+                  .registeredBy,
+                  .deregisteredAt
+                )
+              ) as $baseline
+              | ($baseline.containerDefinitions
+                  | map(select(.name == "novamind-chatbot"))
+                  | length) == 1
+                and
+                (
+                  . == (
+                    $baseline
+                    | (.containerDefinitions[]
+                        | select(.name == "novamind-chatbot")
+                        | .image) = $IMAGE
+                  )
+                )
+            ' new-task.json > /dev/null
+          echo "PASS: Task definition configuration preserved."
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task.json \
+            --query taskDefinition.taskDefinitionArn \
+            --output text)
+
+          echo "TASK_DEFINITION_ARN=$NEW_TASK_ARN" >> "$GITHUB_ENV"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster novamind-chatbot-cluster \
+            --service novamind-chatbot-service \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --output json > /dev/null
+
+      - name: Wait for ECS service stability
+        run: |
+          set -euo pipefail
+
+          if ! aws ecs wait services-stable \
+            --cluster novamind-chatbot-cluster \
+            --services novamind-chatbot-service; then
+
+            echo "::error::ECS service did not stabilize."
+
+            aws ecs describe-services \
+              --cluster novamind-chatbot-cluster \
+              --services novamind-chatbot-service \
+              --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,Deployments:deployments[].{Status:status,RolloutState:rolloutState,Reason:rolloutStateReason},RecentEvents:events[:5].message}' \
+              --output json || true
+
+            exit 1
+          fi
+
+          echo "PASS: ECS service stabilized."
+
+      - name: Verify deployed task definition
+        run: |
+          DEPLOYED_TASK=$(aws ecs describe-services \
+            --cluster novamind-chatbot-cluster \
+            --services novamind-chatbot-service \
+            --query "services[0].taskDefinition" \
+            --output text)
+
+          test "$DEPLOYED_TASK" = "$TASK_DEFINITION_ARN"
+
+          ROLLOUT_STATE=$(aws ecs describe-services \
+            --cluster novamind-chatbot-cluster \
+            --services novamind-chatbot-service \
+            --query "services[0].deployments[?status=='PRIMARY'].rolloutState | [0]" \
+            --output text)
+
+          test "$ROLLOUT_STATE" = "COMPLETED"
+
+          DEPLOYED_IMAGE=$(aws ecs describe-task-definition \
+            --task-definition "$DEPLOYED_TASK" \
+            --query "taskDefinition.containerDefinitions[?name=='novamind-chatbot'].image | [0]" \
+            --output text)
+
+          test "$DEPLOYED_IMAGE" = "$IMAGE_URI"
+
+          echo "Successfully deployed: $DEPLOYED_TASK"
+          echo "Image: $DEPLOYED_IMAGE"
