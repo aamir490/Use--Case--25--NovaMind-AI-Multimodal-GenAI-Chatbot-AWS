@@ -40,7 +40,7 @@ def _render_login_page() -> None:
     with right_col:
         st.markdown("""
         <div class="nm-form-card">
-          <div class="nm-form-title">Welcome back</div>
+          <div class="nm-form-title">Welcome back folk</div>
           <div class="nm-form-sub">Sign in to your NovaMind AI workspace</div>
         </div>
         """, unsafe_allow_html=True)
